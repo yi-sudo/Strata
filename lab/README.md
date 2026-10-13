@@ -1,6 +1,6 @@
 # Faster `--batch` decode: one launch per step for all slots
 
-[繁體中文摘要](#繁體中文摘要)
+[繁體中文](../README.md) · **English**
 
 This branch keeps everything Strata does for a single request (MTP drafts, the QSA attention, the VRAM expert
 cache) and makes **parallel requests (`--batch N` / `"parallel": N`) faster**. It contains an opt-in kernel patch and
@@ -158,26 +158,3 @@ is stopped and restarted around the run).
 - Multi-stream branches were avoided on purpose (upstream disables `STRATA_DF_BRANCH` on Linux open modules, #905).
 - Still per slot: the conv commits and the indexer appends. Grouping them is the next obvious step.
 
----
-
-## 繁體中文摘要
-
-**目標：** 保留 Strata 單一請求的優點（MTP、QSA、專家全放 VRAM），同時讓多個請求並行時的總速度更接近 vLLM。
-
-**原因：** 並行時，上游 Strata 每一輪會替每個請求（slot）分開執行 attention 和 GDN 的 GPU 運算，請求越多，等待的時間越長。
-
-**修改：** 把所有 slot 合併成一次執行，共兩個開關，預設都關閉：
-- `STRATA_BATCH_ATTN_ROWS=1`：attention 合併
-- `STRATA_BATCH_GDN_GROUPS=1`：GDN 合併
-
-**結果：** temperature 0 時輸出與上游逐字相同。
-
-| | 上游 | 修改後 |
-|---|---|---|
-| 1 個請求 | 185 | 181 |
-| 4 個同時（p4） | 268 | **313** |
-| 8 個同時（p8） | 308 | **378** |
-
-**沒有效果的嘗試：** 並行時讓每個請求用 MTP 多猜幾個字，命中率只有 50–57%，不划算，所以預設關閉。
-
-**記憶體：** 每個並行位子會在啟動時就預留最長上下文的空間，跑起來不會再增加。p4 搭配 64K 上下文約 61GB，搭配 262K 約 75GB。

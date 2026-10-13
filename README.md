@@ -1,218 +1,165 @@
-<h1 align="center">Strata</h1>
+# Strata 並行加速（`--batch`）
 
-**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+**繁體中文** · [English](lab/README.md)
 
-> **Fork note (branch `parallel-batch-kernels`):** opt-in kernels that make `--batch N` faster (4 requests: 268 → 313
-> tok/s, 8 requests: 308 → 378 tok/s, byte-identical outputs), with all scripts and raw results. See
-> [lab/README.md](lab/README.md).
+這個分支只改一件事：**讓 [Strata](https://github.com/Niko1221/Strata) 同時處理多個請求時，總速度變快。**
+單一請求的行為不變，MTP、QSA、專家全放 VRAM 都照舊。原版 Strata 的介紹和安裝方式請看
+[原作者的 repo](https://github.com/Niko1221/Strata)。
 
-<p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
-NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
+| | 原版 0.1.43 | 這個分支 |
+|---|---|---|
+| 1 個請求 | 185 tok/s | 181 tok/s |
+| 4 個請求同時跑（`--batch 4`），總速度 | 268 tok/s | **313 tok/s**（+17%） |
+| 8 個請求同時跑（`--batch 8`），總速度 | 308 tok/s | **378 tok/s**（+23%） |
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+temperature 0 時，輸出跟原版**逐字相同**。兩個開關都沒開時，行為就是原版。
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
-large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
-and coding agents. Nothing leaves your PC.
+## 為什麼原版並行會變慢
 
-## How fast is it?
+Strata 並行時，每一輪會把所有請求的下一個字放進同一個「驗證窗口」（最多 8 行）一起算：
 
-We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
+| | 每輪時間 | 每輪產出 |
+|---|---|---|
+| 單一請求 + MTP | 約 6.8 ms | 約 1.56 個字（寫程式時更多） |
+| 原版並行，R 行 | 約 4.8 ms + **每行 2.4 ms** | R 個字 |
 
-- **Writes answers:** how fast the reply appears in a short chat. 60 tokens per second is faster than you can read.
-- **Reads your prompt:** how fast it takes in what you send (here a 32K-token document, code or chat history).
+每行的 2.4 ms 裡，讀專家權重只佔約 0.42 ms，這部分已經達到頻寬上限。
+其餘大多是**每個請求各自排隊執行的小型 GPU 運算**：attention 的打分、選取、計算，以及 GDN 的遞迴，都是一個請求做完才換下一個。
 
-<table>
-<tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
-<tr><td>
+## 改了什麼
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
+兩個環境變數，預設都關閉：
 
-</td><td>
+| 開關 | 作用 |
+|---|---|
+| `STRATA_BATCH_ATTN_ROWS=1` | attention 的打分、top-k、計算，**所有請求合併成一次執行**。每一行仍然讀自己那個請求的資料，算法完全相同。 |
+| `STRATA_BATCH_GDN_GROUPS=1` | GDN 遞迴（窗口內與 commit 時）**所有請求合併成一次執行**。 |
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
+改動的檔案：`src/kernels/cuda/{qsa_decode_attn,qsa_select,verify_kernels}.cu`、對應的 header、`src/core/verify.cpp`。
 
-</td></tr>
-</table>
+使用方式：在模型設定檔（`strata-<model>.json`）加上：
 
-NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K prompts). The full tables are in
-[DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
-about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
-[community results](docs/COMMUNITY_BENCHMARKS.md).
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
-
-## What you need
-
-| | |
-| --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series. It needs **12 GB of VRAM or more**. |
-| **RAM** | 32 GB or more. Your RAM decides [which model](#which-model-should-i-pick) fits. 64 GB runs every size. |
-| **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
-
-The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
-
-Experimental, written and tested by community members on their own machines:
-
-- **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
-- **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
-- **AMD Ryzen AI Max (Strix Halo)**, built from source on Linux: [Strix Halo](docs/STRIX_HALO.md).
-- **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
-
-The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
-
-## Install
-
-### Let your AI set it up
-
-Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
-
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+```json
+"env": { "STRATA_BATCH_ATTN_ROWS": "1", "STRATA_BATCH_GDN_GROUPS": "1" }
 ```
 
-It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
-you how to connect your apps. AI tools can also install, start and stop Strata through its
-[MCP server](docs/MCP_SERVER.md).
+## 測試環境
 
-### Or do it yourself
+- NVIDIA RTX PRO 6000 Blackwell Workstation（96 GB）、driver 610.57.04、CUDA 13.0、Linux
+- Strata 0.1.43（`7695859`）、Qwen3.8-Flash-Next IQ3_S，24,576 個專家全部放在 VRAM
+- `--kv int8 --max-context 262144 --spec 4 --spec-min-p 0.5 --mtp --vision`，沒特別註明時 `--vram-reserve-mib 20480`
+- 負載：用 [`bench_concurrency.py`](lab/bench_concurrency.py) 同時送 N 個串流請求。每個請求是不同的故事題目，所以不會共用前綴快取。每個請求輸出 1024 token，每組跑 2 次。
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-**Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
+## 測試結果
 
-The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
-asks you a few questions:
+### 每輪驗證時間（ms）
 
-- which model and which size,
-- how much context (how much text the model keeps in mind),
-- whether it should read pictures.
+| 行數 | 原版 | 只合併 attention | attention + GDN |
+|---|---|---|---|
+| 2 | 9.57 | 9.02 | 8.82 |
+| 3 | 11.95 | 10.83 | 10.47 |
+| 4 | 14.30 | 12.62 | 12.12 |
+| 6（`--batch 8`） | 19.25 | | 15.92 |
+| 8（`--batch 8`） | 24.55 | | 19.91 |
 
-Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
-download stops, run it again: it continues where it left off. Your browser opens the Strata app at
-`http://127.0.0.1:8080`.
+每多一行的成本：原版約 2.4 ms，修改後約 1.7–1.9 ms。
 
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
-> Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
-> close the window. The window shows what Strata is doing.
+### `--batch 4` 總速度（tok/s）
 
-**Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
-its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
-several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
+數據：[phase4](lab/results/phase4)、[phase5](lab/results/phase5)
 
-**Is it fast on your PC?** Run `BENCH.bat` (`./bench.sh`): about 5-10 minutes, it measures chat, 4K/16K prompts and an agent-style session with your own settings and writes a report to share ([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)).
+| 同時請求數 | 原版 | 只合併 attention | attention + GDN |
+|---|---|---|---|
+| 1 | 185.6 | 181.7 | 181.2 |
+| 2 | 202.4 | 214.4 | 220.3 |
+| 3 | 242.6 | 267.8 | 277.0 |
+| 4 | 268.5 | 302.4 | **312.9** |
 
-## Which model should I pick?
+### `--batch 8` 總速度（tok/s）
 
-The installer recommends one for your RAM. The same model comes in several sizes, compressed more or less. Smaller
-sizes are faster. Larger sizes are a bit smarter.
+數據：[phase6](lab/results/phase6)。這組把預留降到 6144 MiB，讓專家仍然全部放得進 VRAM。
 
-| Your RAM | Take | Why |
-| --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's UD-IQ4_XS (~4-bit) | room for the largest sizes with everything else open |
+| 同時請求數 | 原版 | attention + GDN |
+|---|---|---|
+| 1 | 183.2 | 181.2 |
+| 4 | 267.6 | 313.6 |
+| 6 | 298.6 | 359.2 |
+| 8 | 308.5 | **377.8** |
 
-- **[Coder](docs/MODELS.md#coder):** a coding version with half of the experts removed. It reaches 91% of the full
-  model's SWE-bench Verified score (measured by its authors) and fits 32 GB of RAM. It is weaker outside code,
-  including Chinese and other CJK text (#438). For those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
-- **[Swift 1.5](docs/MODELS.md#swift-15):** a fine-tune that thinks for a much shorter time before it answers. You
-  get the answer sooner, at about the same quality.
-- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs):** Unsloth's ~4-bit version, between IQ3_S and
-  UD-Q4_K_XL in quality. A 94 GB download. With less than ~80 GB of RAM, Strata reads part of it from the SSD
-  while it answers, so it is slower there (an NVMe SSD helps).
-- **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental): the closest to the full
-  model. But Strata reads most of it from the SSD while it answers, so it writes only 7-8.5 tokens/s on a 64 GB PC.
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
-  not in the installer's menu.
+### 正確性
 
-Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
-`SETUP.bat` (Linux: `./setup.sh --setup`).
+[`parity.py`](lab/parity.py) 同時送 4 個 temperature 0 的請求，[`compare_parity.py`](lab/compare_parity.py) 逐字比對修改版和原版的輸出。所有設定都是 `IDENTICAL`。
 
-## Using it
+### 原版基準：p1 / p4 / p8，以及 `--batch-mtp`
 
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
+數據：[production-p1-p4-p8](lab/results/production-p1-p4-p8/summary.txt)。原版 0.1.43，預留 20480 MiB。
+p8 時只有 17,097 個專家放得進 VRAM，所以單一請求比較慢。
 
-- **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
-  GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
-  **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
-  - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
-  - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
-    ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
-- **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
-  fastest. High is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
-  AMD cards read pictures on Linux through the processor; on Windows they can't yet.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,
-  set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
-- **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up
-  messages start in seconds.
+| 同時請求數 | p1 | p4 | p4 + batch-mtp | p8 | p8 + batch-mtp |
+|---|---|---|---|---|---|
+| 1 | 180.0 | 184.8 | 167.7 | 137.8 | 155.2 |
+| 2 | 177.0 | 203.1 | 199.0 | 185.5 | 194.8 |
+| 4 | 179.4 | 267.8 | 239.5 | 252.0 | 231.5 |
+| 8 | 177.0 | 264.9 | 237.1 | 293.0 | 230.6 |
 
-More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
+### 沒有效果的嘗試：並行時每個請求多猜幾個字
 
-## Something went wrong?
+數據：[phase3a](lab/results/phase3a)、[phase3a2](lab/results/phase3a2)
 
-- **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the
-  window. Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again. It continues where
-  it stopped.
-- **It's very slow and the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does
-  not have enough free RAM. Close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
-- **It says port 8080 is already in use.** Strata is already running. Look for its window.
+第二個 commit 加了 `STRATA_BATCH_MTP_D`（預設 1，等於原版），讓每個請求在窗口裡用 MTP 多猜幾個字。
+但並行時猜中率只有 **50–57%**，而每多一行要超過約 67% 才划算。
 
-More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder. Found a
-security problem? Report it privately: [SECURITY.md](SECURITY.md).
+4 個同時請求的總速度：
 
-## How does it work?
+| 設定 | tok/s |
+|---|---|
+| 不開 MTP 的 `--batch 4` | 268 |
+| D=1 | 246 |
+| D=3 | 199 |
+| D=5 | 193 |
 
-Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes the model fit by **sharing the work across your whole PC**. Think of a kitchen: the things
-you use all the time stay on the counter, and the rest waits in the pantry.
+只留作參考。
 
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
+### 記憶體
 
-- **The model is a team of 24,576 small specialists ("experts").** Each word needs only 10 of them.
-- **Your graphics card** keeps the few thousand experts that are used most often. **Your RAM** holds all of them,
-  and **your processor** works on the rest at the same time. **Your SSD** holds a big lookup table.
+數據：[context-memory](lab/results/context-memory/summary.txt)
 
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
+**並行的空間在啟動時就預留好了，跑起來不會再增加。** 4 個請求同時跑之前、之中、之後，都是 73,352 MiB。
+每個位子都預留最長上下文的空間，所以上下文長度決定 p4 要多少記憶體：
 
-- **Guess, then check:** a small helper guesses the next few words. The big model checks them all at once. You get
-  the same answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens at a time), at over 1,000 tokens per second.
+| 設定 | 整張卡 | 1 個請求 | 4 個請求（輸出 512 token） |
+|---|---|---|---|
+| p1，262K | 59.9 GB | 186 | 170（排隊） |
+| p4，64K | 61.1 GB | 181 | 286 |
+| p4，128K | 65.7 GB | 181 | 291 |
+| p4，262K | 約 74.9 GB | 184 | 約 309 |
 
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
-[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
+除了 p1，其他都是修改版。專家 46.8 GiB 每一列都一樣。
 
-## Credits and license
+## 重現
 
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
-compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5)
-and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
-parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
+```bash
+cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
+      -DCMAKE_CUDA_ARCHITECTURES=120 -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
+cmake --build build --target strata -j 16 && cp build/strata engine/strata
+```
 
-## Support Strata
+`lab/` 裡的腳本會在 port 8095 啟動測試用的 server（`lab-start.sh <並行數>`），跑完存到 `lab/results/`，再自動關掉（`lab-stop.sh`）。
 
-Strata is free and open source. If it is useful to you, you can support its development:
+路徑設定在 [`lab/env.sh`](lab/env.sh)。每台機器自己的路徑請寫在 `lab/env.local.sh`（不會上傳），例如 Python、`STRATA_DATA`、`CUDA_HOME`。如果有其他控制台在跑正式版，也可以在這裡設定，測試前後會自動停掉、再恢復。
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+| 腳本 | 測什麼 |
+|---|---|
+| `phase1.sh` | 未修改的版本，p1 對 p4 基準（其中 p1 的 57 tok/s 無效，當時 GPU 上還有另一個實例） |
+| `phase2.sh` | `STRATA_DECODE_TIMING` / `STRATA_VERIFY_PROFILE` 各階段時間 |
+| `phase3a.sh`、`phase3a2.sh` | 多猜幾個字的實驗 |
+| `phase4.sh` | 只合併 attention 對原版，含逐字比對 |
+| `phase5.sh` | attention + GDN，含逐字比對 |
+| `phase6.sh` | `--batch 8` 原版對修改版 |
+| `bench-dashboard.sh`、`context-memory.sh` | 透過 vllm_my 風格的控制台，用不同設定重啟後測試 |
+
+## 限制與後續
+
+- 只在一張卡、一個模型上測過（單張 RTX PRO 6000、IQ3_S、專家全在 VRAM）。沒測過多卡、專家放在 PCIe/CPU 的情況，也沒測過 AMD。
+- 刻意沒有用多 stream。原版在 Linux open module 上關掉了 `STRATA_DF_BRANCH`（#905）。
+- 還有兩部分是每個請求各自執行：conv commit 和 indexer append。下一步可以把它們也合併。

@@ -2,6 +2,10 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
+> **Fork note (branch `parallel-batch-kernels`):** opt-in kernels that make `--batch N` faster (4 requests: 268 → 313
+> tok/s, 8 requests: 308 → 378 tok/s, byte-identical outputs), with all scripts and raw results. See
+> [lab/README.md](lab/README.md).
+
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 

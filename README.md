@@ -1,5 +1,7 @@
 # Strata 並行加速（`--batch`）
 
+> 新版（含 9 種語言說明、一鍵套用腳本、原作者最新版的測試）：**https://github.com/yi-sudo/strata-batch-boost** · PR：https://github.com/Niko1221/Strata/pull/2234
+
 **繁體中文** · [English](lab/README.md)
 
 這個分支只改一件事：**讓 [Strata](https://github.com/Niko1221/Strata) 同時處理多個請求時，總速度變快。**
